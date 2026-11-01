@@ -94,14 +94,6 @@ coverage/
 *.lcov
 .nyc_output
 
-# ==============================================================================
-# Local Working & Scratch Files
-# ==============================================================================
-.taste-skill/
-**/.taste-skill/
-todonext.txt
-test.js
-scratch/
 
 # ==============================================================================
 # OS & Editor Files
@@ -122,3 +114,17 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+
+
+# ==============================================================================
+# Local Working & Scratch Files
+# ==============================================================================
+.taste-skill/
+**/.taste-skill/
+todonext.txt
+test.js
+scratch/
+load-test.js
+docker-compose.yml
+
+nginx

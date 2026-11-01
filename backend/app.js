@@ -1,6 +1,11 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 import { upload } from "./utils/multer.js";
+import {
+  chatRateLimiter,
+  pdfUploadRateLimiter,
+} from "./middlewares/ratelimit.js";
 import {
   chatHandler,
   uploadPdfHandler,
@@ -16,69 +21,81 @@ import {
 
 const app = express();
 
-const allowedOrigins = (process.env.FRONTEND_URL)
+// Trust reverse proxy (Render / Docker) for accurate client IP detection
+app.set("trust proxy", 1);
+
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
   .split(",")
   .map((origin) => origin.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
+app.use(helmet());
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin.trim().replace(/\/+$/, ""))) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin.trim().replace(/\/+$/, ""))
+      ) {
         return callback(null, true);
       }
-      return callback(new Error(`CORS violation: Origin "${origin}" not allowed.`));
+      return callback(
+        new Error(`CORS violation: Origin "${origin}" not allowed.`),
+      );
     },
     credentials: true,
-  })
+  }),
 );
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 // Health & Status Routes
-app.get("/", (req, res) => res.json({ status: "ok", app: "eideticai" }));
-app.get("/api/health", (req, res) => {
-  res.json({ app: "eideticai", status: "healthy", uptime: process.uptime() })
-})
- 
+app.get("/", (req, res) => {
+  res.json({ server: process.env.PORT, status: "ok", app: "eideticai" });
+});
+app.get("/api/health", (req, res) =>
+  res.json({ app: "eideticai", status: "healthy", uptime: process.uptime() }),
+);
 
-
-// Chat & Conversation Routes
-app.post("/api/chat/:conversationId", chatHandler);
-app.post("/api/chat", chatHandler);
+// Chat & Conversation Routes (Rate limit: 60 questions per 60 mins per IP)
+app.post("/api/chat/:conversationId", chatRateLimiter, chatHandler);
 app.get("/api/chat/:conversationId/history", getConversationHistoryHandler);
-app.get("/api/chat/:conversationId", getConversationHistoryHandler);
 app.delete("/api/chat/:conversationId", clearConversationHandler);
 
-// PDF Ingestion Routes
-app.post("/api/chat/:conversationId/upload", upload.single("pdf"), uploadPdfHandler);
-app.post("/api/upload-pdf", upload.single("pdf"), uploadPdfHandler);
-
-
+// PDF Ingestion Routes (Rate limit: 5 uploads per 24 hours per IP)
+app.post(
+  "/api/chat/:conversationId/upload",
+  pdfUploadRateLimiter,
+  upload.single("pdf"),
+  uploadPdfHandler,
+);
 
 // DLQ Admin Authentication Middleware
 app.use("/api/jobs/dlq", (req, res, next) => {
   const expectedAdmin = process.env.ADMIN;
   const expectedPassword = process.env.PASSWORD;
 
-  // Fail-closed if credentials are not configured in .env
   if (!expectedAdmin || !expectedPassword) {
-    return res.status(500).json({ error: "Admin credentials are not configured on the server." });
+    return res
+      .status(500)
+      .json({ error: "Admin credentials are not configured on the server." });
   }
 
-  // 1. Check req.body (for POST / DELETE)
-  // 2. Fallback to headers or query (for GET requests)
   const admin = req.body?.admin || req.headers?.["admin"] || req.query?.admin;
-  const password = req.body?.password || req.headers?.["password"] || req.query?.password;
+  const password =
+    req.body?.password || req.headers?.["password"] || req.query?.password;
 
   if (!admin || !password) {
     return res.status(401).json({
-      error: "Authentication required. Provide 'admin' and 'password' in request body or headers.",
+      error:
+        "Authentication required. Provide 'admin' and 'password' in request body or headers.",
     });
   }
 
   if (admin !== expectedAdmin || password !== expectedPassword) {
-    return res.status(403).json({ error: "Access denied: Invalid admin username or password." });
+    return res
+      .status(403)
+      .json({ error: "Access denied: Invalid admin username or password." });
   }
 
   next();
@@ -93,10 +110,17 @@ app.delete("/api/jobs/dlq/:jobId", removeDlqJobHandler);
 app.get("/api/jobs/:jobId", getJobStatusHandler);
 
 // 404 & Error Handlers
-app.use((req, res) => res.status(404).json({ error: `Not found: ${req.method} ${req.originalUrl}` }));
+app.use((req, res) =>
+  res
+    .status(404)
+    .json({ error: `Not found: ${req.method} ${req.originalUrl}` }),
+);
 app.use((err, req, res, next) => {
   console.error("API Error:", err);
-  res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
+  const isProduction = process.env.NODE_ENV === "production";
+  res
+    .status(err.status || 500)
+    .json({ error: isProduction ? "Internal Server Error" : err.message || "Internal Server Error" });
 });
 
 export default app;

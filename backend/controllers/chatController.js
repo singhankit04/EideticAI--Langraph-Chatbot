@@ -4,6 +4,13 @@ import { chatbotApp, checkpointer } from "../chatbot/graph.js";
 import { addPdfProcessingJob, getJobStatus, getQueueEvents } from "../background_jobs/queue.js";
 import { getDlqJobs, getDlqJob, retryDlqJob, removeDlqJob, clearDlq, getDlqStats } from "../background_jobs/dlq.js";
 
+const isProduction = process.env.NODE_ENV === "production";
+
+// Returns a safe error message: real details in dev, generic fallback in production
+function safeError(err, fallback = "Internal Server Error") {
+  return isProduction ? fallback : (err.message || fallback);
+}
+
 // Extract conversationId / threadId from request
 export function extractConversationId(req) {
   const candidate =
@@ -65,7 +72,7 @@ export async function uploadPdfHandler(req, res) {
     });
   } catch (err) {
     console.error("Upload handler error:", err);
-    return res.status(500).json({ error: err.message || "Failed to process PDF." });
+    return res.status(500).json({ error: safeError(err, "Failed to process PDF.") });
   }
 }
 
@@ -76,7 +83,7 @@ export async function getJobStatusHandler(req, res) {
     if (!status) return res.status(404).json({ error: `Job "${req.params.jobId}" not found.` });
     return res.json(status);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -86,7 +93,7 @@ export async function getDlqJobsHandler(req, res) {
     const [stats, jobs] = await Promise.all([getDlqStats(), getDlqJobs()]);
     return res.json({ stats, jobs });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -96,7 +103,7 @@ export async function getDlqJobDetailsHandler(req, res) {
     if (!job) return res.status(404).json({ error: `DLQ record "${req.params.jobId}" not found.` });
     return res.json(job);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -105,7 +112,7 @@ export async function retryDlqJobHandler(req, res) {
     const result = await retryDlqJob(req.params.jobId);
     return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -114,7 +121,7 @@ export async function removeDlqJobHandler(req, res) {
     const result = await removeDlqJob(req.params.jobId);
     return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -123,7 +130,7 @@ export async function clearDlqHandler(req, res) {
     const result = await clearDlq();
     return res.json(result);
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: safeError(err) });
   }
 }
 
@@ -236,7 +243,7 @@ export async function chatHandler(req, res) {
     return res.json({ answer, sources, conversationId, chatId: conversationId, threadId: conversationId });
   } catch (err) {
     console.error("Chat handler error:", err);
-    return res.status(500).json({ error: err.message || "Failed to process chat message." });
+    return res.status(500).json({ error: safeError(err, "Failed to process chat message.") });
   }
 }
 
@@ -256,7 +263,7 @@ export async function getConversationHistoryHandler(req, res) {
     return res.json({ conversationId, chatId: conversationId, threadId: conversationId, messages, total: messages.length });
   } catch (err) {
     console.error("Get conversation history error:", err);
-    return res.status(500).json({ error: err.message || "Failed to fetch conversation history." });
+    return res.status(500).json({ error: safeError(err, "Failed to fetch conversation history.") });
   }
 }
 
@@ -270,6 +277,6 @@ export async function clearConversationHandler(req, res) {
     return res.json({ message: `Memory checkpoint deleted for "${conversationId}".`, conversationId, chatId: conversationId });
   } catch (err) {
     console.error("Clear conversation error:", err);
-    return res.status(500).json({ error: err.message || "Failed to clear conversation memory." });
+    return res.status(500).json({ error: safeError(err, "Failed to clear conversation memory.") });
   }
 }
