@@ -45,7 +45,7 @@ export function startKeepAliveCron() {
       timezone: "Asia/Kolkata"
     }
   );
-  console.log(`[Keep-Alive] Scheduled every 14 minutes form 6AM - 10PM (IST) targeting "${url}"`);
+  console.log(`[Keep-Alive] Scheduled every 14 minutes targeting "${url}"`);
   return cronTask;
 }
 

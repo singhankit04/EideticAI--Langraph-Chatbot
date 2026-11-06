@@ -189,64 +189,103 @@ export function cleanStructuredOutput(text) {
   return cleaned.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-// Handle chat messages with LangGraph agent
+// Handle chat messages with LangGraph agent via Server-Sent Events (SSE) streaming
 export async function chatHandler(req, res) {
+  const conversationId = extractConversationId(req);
+  const rawQuestion =
+    req.body?.message ||
+    req.body?.question ||
+    (Array.isArray(req.body?.messages) ? req.body.messages[req.body.messages.length - 1]?.content : undefined);
+
+  if (!rawQuestion || !String(rawQuestion).trim()) {
+    return res.status(400).json({ error: "A valid 'message' or 'question' field is required." });
+  }
+
+  const question = String(rawQuestion).trim();
+
+  // Set SSE response headers
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // Disable proxy buffering for Nginx
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
+  }
+
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
-    const conversationId = extractConversationId(req);
-    const rawQuestion =
-      req.body?.message ||
-      req.body?.question ||
-      (Array.isArray(req.body?.messages) ? req.body.messages[req.body.messages.length - 1]?.content : undefined);
-
-    if (!rawQuestion || !String(rawQuestion).trim()) {
-      return res.status(400).json({ error: "A valid 'message' or 'question' field is required." });
-    }
-
-    const question = String(rawQuestion).trim();
-
-    const response = await chatbotApp.invoke(
+    const eventStream = chatbotApp.streamEvents(
       { messages: [new HumanMessage(question)] },
-      { configurable: { thread_id: conversationId } }
+      { configurable: { thread_id: conversationId }, version: "v2" }
     );
 
-    const messages = response.messages || [];
-    const lastMessage = messages[messages.length - 1];
-    const answer = cleanStructuredOutput(lastMessage?.content || "No response generated.");
-
-    // Extract citations from the current turn
     const sources = [];
-    const seen = new Set();
-    let currentTurnStartIndex = -1;
+    const seenSources = new Set();
 
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m._getType?.() === "human" || m.constructor?.name === "HumanMessage" || m.role === "human" || m.type === "human") {
-        currentTurnStartIndex = i;
-        break;
+    for await (const event of eventStream) {
+      // 1. Tool execution notifications (gives user instant feedback during retrieval)
+      if (event.event === "on_tool_start") {
+        const toolName = event.name || "tool";
+        const message =
+          toolName === "search_uploaded_documents"
+            ? "Searching uploaded documents..."
+            : toolName === "tavily_search"
+            ? "Searching the web..."
+            : `Running ${toolName}...`;
+        sendEvent("status", { message, tool: toolName });
       }
-    }
 
-    const currentTurnMessages = currentTurnStartIndex !== -1 ? messages.slice(currentTurnStartIndex + 1) : [lastMessage];
-
-    for (const msg of currentTurnMessages) {
-      if (msg.name === "search_uploaded_documents" && Array.isArray(msg.artifact)) {
-        for (const item of msg.artifact) {
-          const key = `${item.source}:${item.page}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            sources.push(item);
+      // 2. Collect sources when document retrieval tool finishes
+      if (event.event === "on_tool_end" && event.name === "search_uploaded_documents") {
+        const output = event.data?.output;
+        const candidateArtifact = Array.isArray(output) && output.length > 1 ? output[1] : output?.artifact;
+        if (Array.isArray(candidateArtifact)) {
+          for (const item of candidateArtifact) {
+            const key = `${item.source}:${item.page}`;
+            if (!seenSources.has(key)) {
+              seenSources.add(key);
+              sources.push(item);
+            }
           }
+        }
+      }
+
+      // 3. Stream generated answer tokens directly as they arrive from the LLM
+      if (event.event === "on_chat_model_stream") {
+        const chunk = event.data?.chunk;
+        const content = chunk?.content;
+        const hasToolCall = chunk?.tool_call_chunks && chunk.tool_call_chunks.length > 0;
+
+        if (typeof content === "string" && content.length > 0 && !hasToolCall) {
+          sendEvent("token", { token: content });
         }
       }
     }
 
-    return res.json({ answer, sources, conversationId, chatId: conversationId, threadId: conversationId });
+    // 4. Send citations/sources gathered during this turn
+    if (sources.length > 0) {
+      sendEvent("sources", { sources });
+    }
+
+    // 5. Send completion event with metadata
+    sendEvent("done", {
+      conversationId,
+      chatId: conversationId,
+      threadId: conversationId,
+    });
+
+    res.write("data: [DONE]\n\n");
+    return res.end();
   } catch (err) {
-    console.error("Chat handler error:", err);
-    return res.status(500).json({ error: safeError(err, "Failed to process chat message.") });
+    console.error("Chat handler streaming error:", err);
+    sendEvent("error", { error: safeError(err, "Failed to stream chat response.") });
+    res.write("data: [DONE]\n\n");
+    return res.end();
   }
 }
-
 // Retrieve message history from MemorySaver
 export async function getConversationHistoryHandler(req, res) {
   try {

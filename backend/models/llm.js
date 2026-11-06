@@ -6,7 +6,7 @@ import "dotenv/config";
 // Creates primary LLM (Groq) with fallback providers (Gemini -> OpenRouter)
 export function getChatModelWithFallbacks(tools = [], temperature = 0.7) {
   const primary = new ChatGroq({
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey:process.env.GROQ_API_KEY,
     model: "openai/gpt-oss-120b",
     temperature,
   });
@@ -14,7 +14,7 @@ export function getChatModelWithFallbacks(tools = [], temperature = 0.7) {
   const fallbacks = [
     new ChatGoogleGenerativeAI({
       apiKey: process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY,
-      model: "gemini-2.5-flash",
+      model: "gemini-3.5-flash-lite",
       temperature,
     }),
     new ChatOpenRouter({

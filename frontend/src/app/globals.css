@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --background: #5d7e68;
+  --background: #13271d;
   --foreground: #f4f8f5;
   --forest-dark: #1a3427;
   --forest-surface: #224332;
@@ -14,7 +14,7 @@ html, body {
   width: 100%;
   height: 100vh;
   overflow: hidden;
-  background-color: #5d7e68;
+  background-color: #13271d;
   color: var(--foreground);
   font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
