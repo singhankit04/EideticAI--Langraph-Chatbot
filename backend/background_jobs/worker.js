@@ -4,7 +4,7 @@ import { PDFParse } from "pdf-parse";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { QdrantVectorStore } from "@langchain/qdrant";
 import { redis } from "../config/connections.js";
-import { embeddings } from "../models/embeddings.js";
+import { embeddingsModel } from "../llm_models/embeddings.js";
 import { moveToDlq } from "./dlq.js";
 
 let workerInstance = null;
@@ -34,17 +34,24 @@ export async function processPdfJob(job) {
     await parser.destroy();
     validPages = (parsed.pages || []).filter((p) => p.text?.trim().length > 0);
   } catch (err) {
-    throw new UnrecoverableError(`Corrupt or unreadable PDF "${originalName}": ${err.message}`);
+    throw new UnrecoverableError(
+      `Corrupt or unreadable PDF "${originalName}": ${err.message}`,
+    );
   }
 
   if (validPages.length === 0) {
-    throw new UnrecoverableError(`PDF "${originalName}" has 0 readable text pages.`);
+    throw new UnrecoverableError(
+      `PDF "${originalName}" has 0 readable text pages.`,
+    );
   }
 
   await job.updateProgress(45);
 
   // 3. Split into semantic chunks
-  const splitter = new RecursiveCharacterTextSplitter({ chunkSize: 1000, chunkOverlap: 200 });
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
+  });
   const docs = await splitter.createDocuments(
     validPages.map((p) => p.text),
     validPages.map((p) => ({
@@ -55,13 +62,13 @@ export async function processPdfJob(job) {
       threadId: id,
       jobId: String(job.id),
       indexedAt: new Date().toISOString(),
-    }))
+    })),
   );
 
   await job.updateProgress(70);
 
   // 4. Upsert vectors to Qdrant
-  await QdrantVectorStore.fromDocuments(docs, embeddings, {
+  await QdrantVectorStore.fromDocuments(docs, embeddingsModel, {
     url: process.env.QDRANT_URL,
     apiKey: process.env.QDRANT_API_KEY,
     collectionName: process.env.QDRANT_COLLECTION || "rag_documents",
@@ -76,7 +83,9 @@ export async function processPdfJob(job) {
 
   await job.updateProgress(100);
   const durationMs = Date.now() - startTime;
-  console.log(`[Job ${job.id}] Completed in ${durationMs}ms — Indexed ${docs.length} chunks across ${validPages.length} pages.`);
+  console.log(
+    `[Job ${job.id}] Completed in ${durationMs}ms — Indexed ${docs.length} chunks across ${validPages.length} pages.`,
+  );
 
   return {
     success: true,
@@ -99,31 +108,54 @@ export function startPdfWorker() {
     concurrency: 2,
   });
 
-  workerInstance.on("ready", () => console.log("[Worker] PDF Processing Worker ready (concurrency: 2)"));
-  workerInstance.on("active", (job) => console.log(`[Worker] Job ${job.id} active (attempt ${job.attemptsMade + 1}/${job.opts.attempts || 3})`));
-  workerInstance.on("progress", (job, progress) => console.log(`[Worker] Job ${job.id} progress: ${progress}%`));
-  workerInstance.on("completed", (job, result) => console.log(`[Worker] Job ${job.id} completed (chunks: ${result?.chunksCount}, pages: ${result?.pagesCount})`));
+  workerInstance.on("ready", () =>
+    console.log("[Worker] PDF Processing Worker ready (concurrency: 2)"),
+  );
+  workerInstance.on("active", (job) =>
+    console.log(
+      `[Worker] Job ${job.id} active (attempt ${job.attemptsMade + 1}/${job.opts.attempts || 3})`,
+    ),
+  );
+  workerInstance.on("progress", (job, progress) =>
+    console.log(`[Worker] Job ${job.id} progress: ${progress}%`),
+  );
+  workerInstance.on("completed", (job, result) =>
+    console.log(
+      `[Worker] Job ${job.id} completed (chunks: ${result?.chunksCount}, pages: ${result?.pagesCount})`,
+    ),
+  );
 
   workerInstance.on("failed", async (job, err) => {
     if (!job) return;
 
     const maxAttempts = job.opts?.attempts || 3;
     const isExhausted = job.attemptsMade >= maxAttempts;
-    const isUnrecoverable = err?.name === "UnrecoverableError" || err?.name === "BullUnrecoverableError" || err?.isUnrecoverable === true;
+    const isUnrecoverable =
+      err?.name === "UnrecoverableError" ||
+      err?.name === "BullUnrecoverableError" ||
+      err?.isUnrecoverable === true;
 
     if (isExhausted || isUnrecoverable) {
-      console.error(`[Worker] Job ${job.id} failed permanently (${job.attemptsMade}/${maxAttempts}): ${err.message}. Moving to DLQ...`);
+      console.error(
+        `[Worker] Job ${job.id} failed permanently (${job.attemptsMade}/${maxAttempts}): ${err.message}. Moving to DLQ...`,
+      );
       try {
         await moveToDlq(job, err);
       } catch (dlqErr) {
-        console.error(`[Worker] Failed to route job ${job.id} to DLQ: ${dlqErr.message}`);
+        console.error(
+          `[Worker] Failed to route job ${job.id} to DLQ: ${dlqErr.message}`,
+        );
       }
     } else {
-      console.warn(`[Worker] Job ${job.id} failed attempt ${job.attemptsMade}/${maxAttempts}: ${err.message}. Retrying with backoff...`);
+      console.warn(
+        `[Worker] Job ${job.id} failed attempt ${job.attemptsMade}/${maxAttempts}: ${err.message}. Retrying with backoff...`,
+      );
     }
   });
 
-  workerInstance.on("error", (err) => console.error(`[Worker Error] ${err.message}`));
+  workerInstance.on("error", (err) =>
+    console.error(`[Worker Error] ${err.message}`),
+  );
   return workerInstance;
 }
 

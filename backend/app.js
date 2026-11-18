@@ -8,16 +8,19 @@ import {
 } from "./middlewares/ratelimit.js";
 import {
   chatHandler,
-  uploadPdfHandler,
   getConversationHistoryHandler,
   clearConversationHandler,
+} from "./controllers/chatController.js";
+import {
+  uploadPdfHandler,
   getJobStatusHandler,
+  getQueueStatsHandler,
   getDlqJobsHandler,
   getDlqJobDetailsHandler,
   retryDlqJobHandler,
   removeDlqJobHandler,
   clearDlqHandler,
-} from "./controllers/chatController.js";
+} from "./controllers/pdfController.js";
 
 const app = express();
 
@@ -58,14 +61,19 @@ app.get("/api/health", (req, res) =>
 );
 
 // Chat & Conversation Routes (Rate limit: 60 questions per 60 mins per IP)
-app.post("/api/chat/:conversationId", chatRateLimiter, chatHandler);
+app.post("/api/chat/:conversationId", chatHandler);
 app.get("/api/chat/:conversationId/history", getConversationHistoryHandler);
 app.delete("/api/chat/:conversationId", clearConversationHandler);
 
 // PDF Ingestion Routes (Rate limit: 5 uploads per 24 hours per IP)
 app.post(
   "/api/chat/:conversationId/upload",
-  pdfUploadRateLimiter,
+  upload.single("pdf"),
+  uploadPdfHandler,
+);
+// Dedicated PDF upload endpoint
+app.post(
+  "/api/pdf/upload",
   upload.single("pdf"),
   uploadPdfHandler,
 );
@@ -102,6 +110,7 @@ app.use("/api/jobs/dlq", (req, res, next) => {
 });
 
 // Background Job & DLQ Routes
+app.get("/api/jobs/stats", getQueueStatsHandler);
 app.get("/api/jobs/dlq", getDlqJobsHandler);
 app.delete("/api/jobs/dlq", clearDlqHandler);
 app.get("/api/jobs/dlq/:jobId", getDlqJobDetailsHandler);
