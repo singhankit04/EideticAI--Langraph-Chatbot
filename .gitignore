@@ -119,6 +119,8 @@ Thumbs.db
 # ==============================================================================
 # Local Working & Scratch Files
 # ==============================================================================
+/package.json
+/package-lock.json
 .taste-skill/
 **/.taste-skill/
 todonext.txt
