@@ -5,16 +5,37 @@ import "dotenv/config";
 
 // 1. Document Search (RAG) Tool
 export const documentSearchTool = tool(
-  async ({ query }, config) => {
-    const threadId = config?.configurable?.thread_id;
-    if (!threadId) return ["No conversation thread identified.", []];
+  async (args, config) => {
+    // 1. Safely extract query and guard against empty inputs (prevents OpenRouter 400 validation error)
+    const rawQuery = args?.query || args?.input || "";
+    let query = typeof rawQuery === "string" ? rawQuery.trim() : "";
+    if (!query) {
+      return ["No search terms provided. Please provide a specific question or topic to search for in your uploaded documents.", []];
+    }
+
+    // Expand generic summarization queries to match overview, executive summary, and key introductory content
+    const lower = query.toLowerCase();
+    if (
+      lower === "summarize" ||
+      lower === "summary" ||
+      lower === "summarize this" ||
+      lower === "summarize this document" ||
+      lower === "summarize document" ||
+      lower === "overview" ||
+      lower === "what is this document about"
+    ) {
+      query = "overview summary executive summary main purpose key findings introduction table of contents";
+    }
+
+    const chatId = config?.configurable?.thread_id;
+    if (!chatId) return ["No active chat identified.", []];
 
     try {
       const vectorStore = await getQdrantVectorStore("rag_documents");
-      const docs = await vectorStore.similaritySearch(query, 4, {
+      const docs = await vectorStore.similaritySearch(query, 6, {
         should: [
-          { key: "metadata.conversationId", match: { value: threadId } },
-          { key: "metadata.chatId", match: { value: threadId } },
+          { key: "metadata.chatId", match: { value: chatId } },
+          { key: "metadata.conversationId", match: { value: chatId } }, // backward compatibility for previously indexed docs
         ],
       });
 
@@ -39,10 +60,15 @@ export const documentSearchTool = tool(
   },
   {
     name: "search_uploaded_documents",
-    description: "Search and retrieve relevant excerpts from documents uploaded by the user in this conversation.",
+    description: "Search and retrieve relevant excerpts and content from documents uploaded by the user in this conversation. MUST be used whenever the user asks about their document, PDF, report, or contract, or asks to summarize, explain, or extract details from their files.",
     schema: {
       type: "object",
-      properties: { query: { type: "string", description: "Search terms or question" } },
+      properties: {
+        query: {
+          type: "string",
+          description: "Search terms or question to look up in the uploaded documents. For summaries, use descriptive terms such as 'overview summary key points purpose'. Must not be empty.",
+        },
+      },
       required: ["query"],
     },
     responseFormat: "content_and_artifact",

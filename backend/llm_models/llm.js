@@ -12,16 +12,17 @@ export function getChatModelWithFallbacks(tools = [], temperature = 0.7) {
   });
 
   const fallbacks = [
+     new ChatOpenRouter({
+      apiKey: process.env.OPENROUTER_API_KEY,
+      model: "nvidia/nemotron-3.5-lightning:free",
+      temperature,
+    }),
     new ChatGoogleGenerativeAI({
       apiKey: process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY,
       model: "gemini-3.5-flash-lite",
       temperature,
     }),
-    new ChatOpenRouter({
-      apiKey: process.env.OPENROUTER_API_KEY,
-      model: "nvidia/nemotron-3.5-lightning:free",
-      temperature,
-    }),
+   
   ];
 
   if (tools?.length > 0) {

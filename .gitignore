@@ -130,3 +130,5 @@ load-test.js
 docker-compose.yml
 
 nginx
+
+nodemon.json

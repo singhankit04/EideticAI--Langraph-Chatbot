@@ -6,16 +6,17 @@ import { QdrantVectorStore } from "@langchain/qdrant";
 import { redis } from "../config/connections.js";
 import { embeddingsModel } from "../llm_models/embeddings.js";
 import { moveToDlq } from "./dlq.js";
+import { PDF_QUEUE_NAME } from "./queue.js";
 
 let workerInstance = null;
 
 // Extracts text from PDF, splits into chunks, and uploads embeddings to Qdrant
 export async function processPdfJob(job) {
   const startTime = Date.now();
-  const { filePath, originalName, conversationId, chatId, threadId } = job.data;
-  const id = conversationId || chatId || threadId;
+  const { filePath, originalName, chatId } = job.data;
+  const activeChatId = chatId;
 
-  console.log(`[Job ${job.id}] Processing "${originalName}" (${id})`);
+  console.log(`[Job ${job.id}] Processing "${originalName}" (chatId: ${activeChatId})`);
   await job.updateProgress(5);
 
   if (!filePath || !fs.existsSync(filePath)) {
@@ -57,9 +58,7 @@ export async function processPdfJob(job) {
     validPages.map((p) => ({
       source: originalName,
       page: p.num,
-      conversationId: id,
-      chatId: id,
-      threadId: id,
+      chatId: activeChatId,
       jobId: String(job.id),
       indexedAt: new Date().toISOString(),
     })),
@@ -84,14 +83,14 @@ export async function processPdfJob(job) {
   await job.updateProgress(100);
   const durationMs = Date.now() - startTime;
   console.log(
-    `[Job ${job.id}] Completed in ${durationMs}ms — Indexed ${docs.length} chunks across ${validPages.length} pages.`,
+    `[Job ${job.id}] Completed in ${durationMs}ms — Indexed ${docs.length} chunks across ${validPages.length} pages (chatId: ${activeChatId}).`,
   );
 
   return {
     success: true,
     jobId: job.id,
     originalName,
-    conversationId: id,
+    chatId: activeChatId,
     pagesCount: validPages.length,
     chunksCount: docs.length,
     durationMs,
@@ -100,16 +99,17 @@ export async function processPdfJob(job) {
 }
 
 // Start BullMQ background worker for PDF processing
+// Concurrency is set to 1 to avoid hitting OpenRouter rate limits (429) on free embedding tiers and avoid memory spikes
 export function startPdfWorker() {
   if (workerInstance) return workerInstance;
 
-  workerInstance = new Worker("pdf-processing-queue", processPdfJob, {
+  workerInstance = new Worker(PDF_QUEUE_NAME, processPdfJob, {
     connection: redis.duplicate(),
-    concurrency: 2,
+    concurrency: 1,
   });
 
   workerInstance.on("ready", () =>
-    console.log("[Worker] PDF Processing Worker ready (concurrency: 2)"),
+    console.log(`[Worker] PDF Processing Worker ready on [${PDF_QUEUE_NAME}] (concurrency: 1)`),
   );
   workerInstance.on("active", (job) =>
     console.log(

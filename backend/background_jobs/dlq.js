@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { pdfDlqQueue, pdfQueue } from "./queue.js";
+import { pdfDlqQueue, pdfQueue, PDF_QUEUE_NAME } from "./queue.js";
 
 // Classify error type for easier debugging
 export function categorizeError(error) {
@@ -15,16 +15,17 @@ export function categorizeError(error) {
 // Move permanently failed job into the DLQ
 export async function moveToDlq(job, error) {
   const errorCategory = categorizeError(error);
+  const chatId = job.data?.chatId;
 
   const dlqJob = await pdfDlqQueue.add(
     "dead-letter-job",
     {
       originalJobId: job.id,
-      originalQueue: job.queueName || "pdf-processing-queue",
+      originalQueue: job.queueName || PDF_QUEUE_NAME,
       originalName: job.data.originalName,
       filePath: job.data.filePath,
       fileSize: job.data.fileSize,
-      conversationId: job.data.conversationId,
+      chatId,
       failedReason: error.message || "Unknown processing failure",
       stackTrace: error.stack || null,
       errorCategory,
@@ -35,7 +36,7 @@ export async function moveToDlq(job, error) {
     { jobId: `dlq-${job.id}-${Date.now()}` }
   );
 
-  console.error(`[DLQ] Job ${job.id} moved to DLQ (Category: ${errorCategory}, File: ${job.data.originalName})`);
+  console.error(`[DLQ] Job ${job.id} moved to DLQ (Category: ${errorCategory}, File: ${job.data.originalName}, Chat: ${chatId})`);
   return dlqJob;
 }
 
@@ -61,7 +62,9 @@ export async function retryDlqJob(dlqJobId) {
   const dlqJob = await pdfDlqQueue.getJob(dlqJobId);
   if (!dlqJob) throw new Error(`DLQ Job with ID "${dlqJobId}" not found.`);
 
-  const { filePath, originalName, fileSize, conversationId, originalPayload } = dlqJob.data;
+  const { filePath, originalName, fileSize, chatId, originalPayload } = dlqJob.data;
+  const targetChatId = chatId;
+
   if (filePath && !fs.existsSync(filePath)) {
     throw new Error(`Cannot retry job: File "${filePath}" no longer exists on disk.`);
   }
@@ -72,9 +75,7 @@ export async function retryDlqJob(dlqJobId) {
       filePath,
       originalName,
       fileSize,
-      conversationId,
-      chatId: conversationId,
-      threadId: conversationId,
+      chatId: targetChatId,
       customMetadata: originalPayload?.customMetadata || {},
       retriedFromDlqAt: new Date().toISOString(),
       previousDlqId: dlqJobId,
@@ -83,7 +84,7 @@ export async function retryDlqJob(dlqJobId) {
   );
 
   await dlqJob.remove();
-  console.log(`[DLQ] Retried "${dlqJobId}" -> Created active job "${newJob.id}"`);
+  console.log(`[DLQ] Retried "${dlqJobId}" -> Created active job "${newJob.id}" (chatId: ${targetChatId})`);
   return { success: true, newJobId: newJob.id, dlqJobId, message: `Job re-queued successfully as "${newJob.id}".` };
 }
 

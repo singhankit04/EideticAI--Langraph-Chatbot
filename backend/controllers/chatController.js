@@ -1,38 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { HumanMessage } from "@langchain/core/messages";
 import { chatbotApp, checkpointer } from "../chatbot/graph.js";
-
-// Re-export PDF upload & queue handlers from pdfController for backward compatibility
-export {
-  uploadPdfHandler,
-  getJobStatusHandler,
-  getQueueStatsHandler,
-  getDlqJobsHandler,
-  getDlqJobDetailsHandler,
-  retryDlqJobHandler,
-  removeDlqJobHandler,
-  clearDlqHandler,
-} from "./pdfController.js";
+import { Chat } from "../models/Chat.js";
+import { Message } from "../models/Message.js";
 
 const isProduction = process.env.NODE_ENV === "production";
 
-// Returns a safe error message: real details in dev, generic fallback in production
+// Returns safe error message: real details in dev, generic fallback in production
 export function safeError(err, fallback = "Internal Server Error") {
   return isProduction ? fallback : err?.message || fallback;
 }
 
-// Extract conversationId / threadId from request
-export function extractConversationId(req) {
+// Extract unified chatId from request
+export function extractChatId(req) {
   const candidate =
-    req.params?.conversationId ||
     req.params?.chatId ||
-    req.body?.conversationId ||
-    req.body?.conversation_id ||
-    req.body?.threadId ||
     req.body?.chatId ||
-    req.headers?.["x-conversation-id"] ||
-    req.headers?.["x-chat-id"] ||
-    req.query?.conversationId ||
     req.query?.chatId;
 
   return candidate && String(candidate).trim()
@@ -40,81 +23,9 @@ export function extractConversationId(req) {
     : randomUUID();
 }
 
-// Sanitize tables and excessive asterisks in LLM response
-export function cleanStructuredOutput(text) {
-  if (!text || typeof text !== "string") return text || "";
-
-  const lines = text.split("\n");
-  const cleaned = [];
-  let inTable = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i];
-    const trimmed = rawLine.trim();
-
-    // Skip table delimiter row |---|---|
-    if (/^\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?$/.test(trimmed)) {
-      inTable = true;
-      continue;
-    }
-
-    // Clean headings wrapped in **
-    if (/^\*\*[^*]+\*\*$/.test(trimmed)) {
-      cleaned.push(trimmed.slice(2, -2).trim());
-      continue;
-    }
-
-    // Convert pipe tables to clean bullet points
-    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
-      const cells = trimmed
-        .slice(1, -1)
-        .split("|")
-        .map((c) =>
-          c
-            .trim()
-            .replace(/^\*\*|\*\*$/g, "")
-            .trim(),
-        )
-        .filter(Boolean);
-
-      if (cells.length === 0) continue;
-
-      const lowerFirst = cells[0].toLowerCase();
-      if (
-        !inTable &&
-        ["section", "topic", "field", "category", "item"].includes(lowerFirst)
-      ) {
-        inTable = true;
-        continue;
-      }
-
-      inTable = true;
-      cleaned.push(
-        cells.length >= 2
-          ? `• ${cells[0]}: ${cells.slice(1).join(" — ")}`
-          : `• ${cells[0]}`,
-      );
-      continue;
-    } else {
-      inTable = false;
-    }
-
-    cleaned.push(
-      rawLine.includes("|")
-        ? rawLine.replace(/\s*\|\s*/g, " — ").replace(/\*{3,}/g, "**")
-        : rawLine.replace(/\*{3,}/g, "**"),
-    );
-  }
-
-  return cleaned
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 // Handle chat messages with LangGraph agent via Server-Sent Events (SSE) streaming
 export async function chatHandler(req, res) {
-  const conversationId = extractConversationId(req);
+  const chatId = extractChatId(req);
   const rawQuestion =
     req.body?.message ||
     req.body?.question ||
@@ -129,6 +40,33 @@ export async function chatHandler(req, res) {
   }
 
   const question = String(rawQuestion).trim();
+  const userId = req.user?._id || req.userId;
+
+  // If user is authenticated, ensure Chat session exists and record user message
+  let activeChat = null;
+  if (userId) {
+    try {
+      activeChat = await Chat.findOne({ chatId, userId });
+      if (!activeChat) {
+        const autoTitle =
+          question.length > 40 ? `${question.slice(0, 37)}...` : question;
+        activeChat = await Chat.create({
+          userId,
+          chatId,
+          title: autoTitle || "New Conversation",
+        });
+      }
+
+      await Message.create({
+        chatId,
+        userId,
+        role: "human",
+        content: question,
+      });
+    } catch (dbErr) {
+      console.warn("[ChatHandler DB Warning]:", dbErr.message);
+    }
+  }
 
   // Set SSE response headers
   res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -146,14 +84,15 @@ export async function chatHandler(req, res) {
   try {
     const eventStream = chatbotApp.streamEvents(
       { messages: [new HumanMessage(question)] },
-      { configurable: { thread_id: conversationId }, version: "v2" },
+      { configurable: { thread_id: chatId }, version: "v2" },
     );
 
     const sources = [];
     const seenSources = new Set();
+    let accumulatedResponse = "";
 
     for await (const event of eventStream) {
-      // 1. Tool execution notifications (gives user instant feedback during retrieval)
+      // 1. Tool execution notifications
       if (event.event === "on_tool_start") {
         const toolName = event.name || "tool";
         const message =
@@ -186,7 +125,7 @@ export async function chatHandler(req, res) {
         }
       }
 
-      // 3. Stream generated answer tokens directly as they arrive from the LLM
+      // 3. Stream generated answer tokens directly as they arrive from LLM
       if (event.event === "on_chat_model_stream") {
         const chunk = event.data?.chunk;
         const content = chunk?.content;
@@ -194,6 +133,7 @@ export async function chatHandler(req, res) {
           chunk?.tool_call_chunks && chunk.tool_call_chunks.length > 0;
 
         if (typeof content === "string" && content.length > 0 && !hasToolCall) {
+          accumulatedResponse += content;
           sendEvent("token", { token: content });
         }
       }
@@ -204,12 +144,34 @@ export async function chatHandler(req, res) {
       sendEvent("sources", { sources });
     }
 
-    // 5. Send completion event with metadata
-    sendEvent("done", {
-      conversationId,
-      chatId: conversationId,
-      threadId: conversationId,
-    });
+    // 5. Persist assistant response & update chat metadata if user is authenticated
+    if (userId && accumulatedResponse) {
+      try {
+        await Message.create({
+          chatId,
+          userId,
+          role: "assistant",
+          content: accumulatedResponse,
+          sources: sources.length > 0 ? sources : [],
+        });
+
+        const updateFields = { lastMessageAt: new Date() };
+        if (activeChat && activeChat.title === "New Conversation") {
+          updateFields.title =
+            question.length > 40 ? `${question.slice(0, 37)}...` : question;
+        }
+
+        await Chat.updateOne(
+          { chatId, userId },
+          { $set: updateFields },
+        );
+      } catch (dbErr) {
+        console.warn("[ChatHandler Save AI Msg Warning]:", dbErr.message);
+      }
+    }
+
+    // 6. Send completion event with unified chatId
+    sendEvent("done", { chatId });
 
     res.write("data: [DONE]\n\n");
     return res.end();
@@ -223,12 +185,29 @@ export async function chatHandler(req, res) {
   }
 }
 
-// Retrieve message history from MemorySaver
+// Retrieve message history (from MongoDB Message collection if user is authenticated, else checkpointer)
 export async function getConversationHistoryHandler(req, res) {
   try {
-    const conversationId = extractConversationId(req);
+    const chatId = extractChatId(req);
+    const userId = req.user?._id || req.userId;
+
+    if (userId) {
+      const messages = await Message.find({ chatId, userId })
+        .sort({ createdAt: 1 })
+        .lean();
+
+      if (messages.length > 0) {
+        return res.json({
+          chatId,
+          messages,
+          total: messages.length,
+        });
+      }
+    }
+
+    // Fallback: Read state directly from LangGraph checkpointer
     const state = await chatbotApp.getState({
-      configurable: { thread_id: conversationId },
+      configurable: { thread_id: chatId },
     });
 
     const messages = (state?.values?.messages || []).map((msg) => ({
@@ -241,9 +220,7 @@ export async function getConversationHistoryHandler(req, res) {
     }));
 
     return res.json({
-      conversationId,
-      chatId: conversationId,
-      threadId: conversationId,
+      chatId,
       messages,
       total: messages.length,
     });
@@ -255,17 +232,180 @@ export async function getConversationHistoryHandler(req, res) {
   }
 }
 
-// Clear MemorySaver state for conversation
+// List all chat conversations for authenticated user
+export async function getUserChatsHandler(req, res) {
+  try {
+    const userId = req.user?._id || req.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const chats = await Chat.find({ userId })
+      .sort({ isPinned: -1, lastMessageAt: -1, updatedAt: -1 })
+      .lean();
+
+    return res.json({ chats, total: chats.length });
+  } catch (err) {
+    console.error("[Get User Chats Error]:", err);
+    return res
+      .status(500)
+      .json({ error: safeError(err, "Failed to fetch user chat list.") });
+  }
+}
+
+// Create a new chat session for authenticated user
+export async function createChatHandler(req, res) {
+  try {
+    const userId = req.user?._id || req.userId;
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const chatId =
+      req.body?.chatId && String(req.body.chatId).trim()
+        ? String(req.body.chatId).trim()
+        : randomUUID();
+
+    const title =
+      req.body?.title && String(req.body.title).trim()
+        ? String(req.body.title).trim()
+        : "New Conversation";
+
+    const chat = await Chat.create({
+      userId,
+      chatId,
+      title,
+    });
+
+    return res.status(201).json({ chat });
+  } catch (err) {
+    console.error("[Create Chat Error]:", err);
+    return res
+      .status(500)
+      .json({ error: safeError(err, "Failed to create conversation session.") });
+  }
+}
+
+// Get messages and metadata for a specific chat
+export async function getChatMessagesHandler(req, res) {
+  try {
+    const userId = req.user?._id || req.userId;
+    const chatId = req.params?.chatId || extractChatId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const chat = await Chat.findOne({ chatId, userId }).lean();
+    if (!chat) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    const messages = await Message.find({ chatId, userId })
+      .sort({ createdAt: 1 })
+      .lean();
+
+    return res.json({
+      chatId,
+      chat,
+      messages,
+      total: messages.length,
+    });
+  } catch (err) {
+    console.error("[Get Chat Messages Error]:", err);
+    return res
+      .status(500)
+      .json({ error: safeError(err, "Failed to fetch chat messages.") });
+  }
+}
+
+// Update chat session title or pinned status
+export async function updateChatHandler(req, res) {
+  try {
+    const userId = req.user?._id || req.userId;
+    const chatId = req.params?.chatId || extractChatId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const updates = {};
+    if (typeof req.body?.title === "string") {
+      updates.title = req.body.title.trim();
+    }
+    if (typeof req.body?.isPinned === "boolean") {
+      updates.isPinned = req.body.isPinned;
+    }
+
+    const chat = await Chat.findOneAndUpdate(
+      { chatId, userId },
+      { $set: updates },
+      { new: true },
+    ).lean();
+
+    if (!chat) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    return res.json({ chat });
+  } catch (err) {
+    console.error("[Update Chat Error]:", err);
+    return res
+      .status(500)
+      .json({ error: safeError(err, "Failed to update chat.") });
+  }
+}
+
+// Delete chat session, its messages, and clear LangGraph checkpointer state
+export async function deleteChatHandler(req, res) {
+  try {
+    const userId = req.user?._id || req.userId;
+    const chatId = req.params?.chatId || extractChatId(req);
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const deleted = await Chat.findOneAndDelete({ chatId, userId });
+    if (!deleted) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    await Message.deleteMany({ chatId, userId });
+
+    if (checkpointer && typeof checkpointer.deleteThread === "function") {
+      await checkpointer.deleteThread(chatId).catch(() => {});
+    }
+
+    return res.json({
+      message: `Conversation "${chatId}" deleted successfully.`,
+      chatId,
+    });
+  } catch (err) {
+    console.error("[Delete Chat Error]:", err);
+    return res
+      .status(500)
+      .json({ error: safeError(err, "Failed to delete chat.") });
+  }
+}
+
+// Clear messages and checkpointer for a chat (keeps the chat record)
 export async function clearConversationHandler(req, res) {
   try {
-    const conversationId = extractConversationId(req);
-    if (checkpointer && typeof checkpointer.deleteThread === "function") {
-      await checkpointer.deleteThread(conversationId);
+    const chatId = extractChatId(req);
+    const userId = req.user?._id || req.userId;
+
+    if (userId) {
+      await Message.deleteMany({ chatId, userId });
     }
+
+    if (checkpointer && typeof checkpointer.deleteThread === "function") {
+      await checkpointer.deleteThread(chatId).catch(() => {});
+    }
+
     return res.json({
-      message: `Memory checkpoint deleted for "${conversationId}".`,
-      conversationId,
-      chatId: conversationId,
+      message: `Memory checkpoint deleted for "${chatId}".`,
+      chatId,
     });
   } catch (err) {
     console.error("Clear conversation error:", err);
@@ -279,7 +419,11 @@ export default {
   chatHandler,
   getConversationHistoryHandler,
   clearConversationHandler,
-  cleanStructuredOutput,
-  extractConversationId,
+  getUserChatsHandler,
+  createChatHandler,
+  getChatMessagesHandler,
+  updateChatHandler,
+  deleteChatHandler,
+  extractChatId,
   safeError,
 };

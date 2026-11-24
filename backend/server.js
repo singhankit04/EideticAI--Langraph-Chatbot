@@ -1,8 +1,8 @@
+import "dotenv/config";
 import app from "./app.js";
 import { checkConnections } from "./config/connections.js";
 import { startPdfWorker, stopPdfWorker } from "./background_jobs/worker.js";
 import { startKeepAliveCron, stopKeepAliveCron } from "./cronjob/keepAlive.js";
-import "dotenv/config";
 
 const PORT = process.env.PORT || 5000;
 

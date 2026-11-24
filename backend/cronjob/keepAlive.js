@@ -5,7 +5,7 @@ let cronTask = null;
 
 // Resolves healthcheck URL from BACKEND_URL
 export function getHealthUrl() {
-  const base = (process.env.BACKEND_URL).replace(/\/+$/, "");
+  const base = (process.env.BACKEND_URL || "http://localhost:5000").replace(/\/+$/, "");
   return base.endsWith("/api/health") ? base : `${base}/api/health`;
 }
 

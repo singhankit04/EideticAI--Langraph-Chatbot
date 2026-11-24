@@ -1,8 +1,21 @@
 import { Queue, QueueEvents } from "bullmq";
 import { redis } from "../config/connections.js";
 
+// Queue names isolated by environment to prevent remote instances (e.g. Render) from consuming local files
+export const PDF_QUEUE_NAME =
+  process.env.PDF_QUEUE_NAME ||
+  (process.env.NODE_ENV === "production"
+    ? "pdf-processing-queue"
+    : "pdf-processing-queue-dev");
+
+export const PDF_DLQ_NAME =
+  process.env.PDF_DLQ_NAME ||
+  (process.env.NODE_ENV === "production"
+    ? "pdf-processing-dlq"
+    : "pdf-processing-dlq-dev");
+
 // Primary queue for PDF ingestion and vectorization
-export const pdfQueue = new Queue("pdf-processing-queue", {
+export const pdfQueue = new Queue(PDF_QUEUE_NAME, {
   connection: redis,
   defaultJobOptions: {
     attempts: 3,
@@ -13,7 +26,7 @@ export const pdfQueue = new Queue("pdf-processing-queue", {
 });
 
 // Dead letter queue for permanently failed jobs
-export const pdfDlqQueue = new Queue("pdf-processing-dlq", {
+export const pdfDlqQueue = new Queue(PDF_DLQ_NAME, {
   connection: redis,
   defaultJobOptions: {
     removeOnComplete: false,
@@ -25,20 +38,18 @@ export const pdfDlqQueue = new Queue("pdf-processing-dlq", {
 let queueEventsInstance = null;
 export function getQueueEvents() {
   if (!queueEventsInstance) {
-    queueEventsInstance = new QueueEvents("pdf-processing-queue", {
+    queueEventsInstance = new QueueEvents(PDF_QUEUE_NAME, {
       connection: redis.duplicate(),
     });
   }
   return queueEventsInstance;
 }
 
-
-
-
-
-
 // Enqueue an uploaded PDF for background processing
-export async function addPdfProcessingJob({ filePath, originalName, fileSize, conversationId, customMetadata = {} }, jobOptions = {}) {
+export async function addPdfProcessingJob(
+  { filePath, originalName, fileSize, chatId, customMetadata = {} },
+  jobOptions = {}
+) {
   if (!filePath) throw new Error("Cannot enqueue PDF job without a valid filePath.");
 
   const job = await pdfQueue.add(
@@ -47,16 +58,14 @@ export async function addPdfProcessingJob({ filePath, originalName, fileSize, co
       filePath,
       originalName,
       fileSize,
-      conversationId,
-      chatId: conversationId,
-      threadId: conversationId,
+      chatId,
       enqueuedAt: new Date().toISOString(),
       customMetadata,
     },
     jobOptions
   );
 
-  console.log(`[Queue] Enqueued job ${job.id} for "${originalName}" (${conversationId})`);
+  console.log(`[Queue] Enqueued job ${job.id} for "${originalName}" (chatId: ${chatId}) on [${PDF_QUEUE_NAME}]`);
   return job;
 }
 
@@ -75,7 +84,7 @@ export async function getJobStatus(jobId) {
     data: {
       originalName: job.data.originalName,
       fileSize: job.data.fileSize,
-      conversationId: job.data.conversationId,
+      chatId: job.data.chatId || job.data.conversationId,
       enqueuedAt: job.data.enqueuedAt,
     },
     failedReason: job.failedReason,
@@ -87,6 +96,8 @@ export async function getJobStatus(jobId) {
 }
 
 export default {
+  PDF_QUEUE_NAME,
+  PDF_DLQ_NAME,
   pdfQueue,
   pdfDlqQueue,
   addPdfProcessingJob,

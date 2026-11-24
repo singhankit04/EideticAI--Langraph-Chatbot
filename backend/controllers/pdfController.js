@@ -17,23 +17,16 @@ import {
 
 const isProduction = process.env.NODE_ENV === "production";
 
-// Returns a safe error message: real details in dev, generic fallback in production
+// Returns safe error message: real details in dev, generic fallback in production
 export function safeError(err, fallback = "Internal Server Error") {
   return isProduction ? fallback : err?.message || fallback;
 }
 
-// Extract conversationId / threadId from request
-export function extractConversationId(req) {
+// Extract unified chatId from request
+export function extractChatId(req) {
   const candidate =
-    req.params?.conversationId ||
     req.params?.chatId ||
-    req.body?.conversationId ||
-    req.body?.conversation_id ||
-    req.body?.threadId ||
     req.body?.chatId ||
-    req.headers?.["x-conversation-id"] ||
-    req.headers?.["x-chat-id"] ||
-    req.query?.conversationId ||
     req.query?.chatId;
 
   return candidate && String(candidate).trim()
@@ -42,20 +35,20 @@ export function extractConversationId(req) {
 }
 
 /**
- * Upload & enqueue PDF for asynchronous processing via message queue (BullMQ).
- * 
- * Flow:
- * 1. Validates presence and non-empty size of uploaded PDF file.
- * 2. Extracts conversationId / threadId.
- * 3. Enqueues job to BullMQ `pdf-processing-queue`.
- * 4. Responds immediately with HTTP 202 (Accepted) and jobId for background tracking.
- *    (Or if ?wait=true / ?sync=true is specified, waits synchronously for job completion).
+ * Upload & process PDF.
+ *
+ * Supports two modes:
+ * 1. Synchronous (default when wait=true or when awaiting job completion):
+ *    Waits for BullMQ worker to finish via job.waitUntilFinished() with a safe timeout.
+ * 2. Asynchronous (when wait=false / background mode):
+ *    Immediately returns HTTP 202 with jobId for tracking via /api/jobs/:jobId.
  */
 export async function uploadPdfHandler(req, res) {
   let uploadedFilePath = null;
+  let isEnqueued = false;
 
   try {
-    const conversationId = extractConversationId(req);
+    const chatId = extractChatId(req);
 
     if (!req.file) {
       return res.status(400).json({
@@ -78,67 +71,68 @@ export async function uploadPdfHandler(req, res) {
     let customMetadata = {};
     if (req.body?.metadata) {
       try {
-        customMetadata = typeof req.body.metadata === "string"
-          ? JSON.parse(req.body.metadata)
-          : req.body.metadata;
+        customMetadata =
+          typeof req.body.metadata === "string"
+            ? JSON.parse(req.body.metadata)
+            : req.body.metadata;
       } catch (parseErr) {
         console.warn(`[PDF Controller] Could not parse custom metadata: ${parseErr.message}`);
       }
     }
 
-    // Enqueue job into BullMQ message queue for async processing
+    // Enqueue job into BullMQ message queue for processing
     const job = await addPdfProcessingJob({
       filePath: req.file.path,
       originalName: req.file.originalname,
       fileSize: req.file.size,
-      conversationId,
+      chatId,
       customMetadata,
     });
 
-    console.log(`[PDF Controller] Enqueued job ${job.id} for "${req.file.originalname}" (${conversationId})`);
+    isEnqueued = true;
+    console.log(`[PDF Controller] Enqueued job ${job.id} for "${req.file.originalname}" (chatId: ${chatId})`);
 
-    // Synchronous wait if ?wait=true or ?sync=true
-    if (req.query?.wait === "true" || req.query?.sync === "true") {
-      const timeoutMs = Number(req.query.timeout) || 120000;
-      const result = await job.waitUntilFinished(getQueueEvents(), timeoutMs);
+    // Check if synchronous wait is requested or enabled
+    // If ?async=true, return 202 immediately. Otherwise await completion with safe timeout (120s default).
+    const isAsyncMode = req.query?.async === "true" || req.query?.background === "true";
 
-      return res.status(200).json({
-        message: `Successfully indexed "${req.file.originalname}" for conversation!`,
-        status: "completed",
-        conversationId,
-        chatId: conversationId,
-        threadId: conversationId,
-        source: req.file.originalname,
-        pagesCount: result?.pagesCount || 1,
-        chunksCount: result?.chunksCount || 0,
-        durationMs: result?.durationMs,
+    if (isAsyncMode) {
+      return res.status(202).json({
+        message: `Upload accepted. Processing "${req.file.originalname}" in the background.`,
+        status: "queued",
         jobId: job.id,
+        chatId,
+        source: req.file.originalname,
+        fileSize: req.file.size,
+        statusUrl: `/api/jobs/${job.id}`,
       });
     }
 
-    // Asynchronous processing response (202 Accepted)
-    return res.status(202).json({
-      message: `Upload accepted. Processing "${req.file.originalname}" in the background.`,
-      status: "queued",
-      jobId: job.id,
-      conversationId,
-      chatId: conversationId,
-      threadId: conversationId,
+    // Synchronous wait with a defined timeout (prevents hanging forever)
+    const timeoutMs = Number(req.query?.timeout) || 120000;
+    const result = await job.waitUntilFinished(getQueueEvents(), timeoutMs);
+
+    return res.status(200).json({
+      message: `Successfully indexed "${req.file.originalname}"!`,
+      status: "completed",
+      chatId,
       source: req.file.originalname,
-      fileSize: req.file.size,
-      pagesCount: 1,
-      statusUrl: `/api/jobs/${job.id}`,
+      pagesCount: result?.pagesCount || 1,
+      chunksCount: result?.chunksCount || 0,
+      durationMs: result?.durationMs,
+      jobId: job.id,
     });
   } catch (err) {
     console.error("[PDF Controller] Upload handler error:", err);
 
-    // Clean up uploaded file if enqueueing failed
-    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+    // ONLY unlink the file if the job was NOT enqueued to the queue.
+    // Once enqueued, the background worker owns the file lifecycle to prevent "File not found" race conditions.
+    if (!isEnqueued && uploadedFilePath && fs.existsSync(uploadedFilePath)) {
       await fs.promises.unlink(uploadedFilePath).catch(() => {});
     }
 
     return res.status(500).json({
-      error: safeError(err, "Failed to process and enqueue PDF."),
+      error: safeError(err, "Failed to process and index PDF."),
     });
   }
 }
@@ -258,7 +252,6 @@ export default {
   retryDlqJobHandler,
   removeDlqJobHandler,
   clearDlqHandler,
-  extractConversationId,
+  extractChatId,
   safeError,
 };
-
